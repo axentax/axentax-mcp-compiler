@@ -139,3 +139,6 @@ vite.config.js.timestamp-*
 vite.config.ts.timestamp-*
 
 x-todo.md
+CLAUDE.md
+.claude
+AGENT.md
