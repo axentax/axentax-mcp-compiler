@@ -1,45 +1,42 @@
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import {
+  ListToolsRequestSchema,
+  CallToolRequestSchema,
+  ListResourcesRequestSchema,
+  ListResourceTemplatesRequestSchema,
+  ReadResourceRequestSchema
+} from "@modelcontextprotocol/sdk/types.js";
 import express from "express";
 import fs from "fs/promises";
 import path from "path";
 import crypto from "crypto";
 import pino from "pino";
-import { z } from "zod";
 
-// Placeholder for axentax compiler - replace with actual implementation
-// import { compile, validate as axValidate } from "axentax-compiler";
+// Use real axentax-compiler
+import { Conductor } from "axentax-compiler/dist/conductor.js";
 
-// Temporary placeholder functions until axentax-compiler is available
+// Wrap real compiler API
 async function axValidate(axText: string): Promise<void> {
-  if (!axText.trim()) {
-    throw { details: [{ message: "Empty input", line: 1, column: 1 }] };
+  const chordDic = new Map();
+  const allowAnnotations: any[] = [];
+  const mapSeed: any = {};
+  const res = Conductor.convertToObj(false, false, axText, allowAnnotations, chordDic as any, mapSeed as any);
+  if (res.error) {
+    throw { details: [{ message: res.error.message, line: res.error.line, column: res.error.linePos, token: res.error.token }] };
   }
-  // Add more validation logic here based on actual Axentax syntax
 }
 
-async function compile(axText: string, options?: any): Promise<Buffer> {
-  // Placeholder - replace with actual axentax-compiler logic
-  await axValidate(axText);
-  
-  // Return a minimal valid MIDI file for testing
-  return Buffer.from([
-    0x4D, 0x54, 0x68, 0x64, // "MThd"
-    0x00, 0x00, 0x00, 0x06, // Header length
-    0x00, 0x00, // Format 0
-    0x00, 0x01, // 1 track
-    0x00, 0x60, // 96 ticks per quarter note
-    
-    0x4D, 0x54, 0x72, 0x6B, // "MTrk"
-    0x00, 0x00, 0x00, 0x0B, // Track length (11 bytes)
-    
-    // Simple note: C4 on, C4 off
-    0x00, 0x90, 0x3C, 0x40, // Note on C4
-    0x60, 0x80, 0x3C, 0x40, // Note off C4
-    
-    // End of track
-    0x00, 0xFF, 0x2F, 0x00
-  ]);
+async function compile(axText: string, _options?: any): Promise<Buffer> {
+  const chordDic = new Map();
+  const allowAnnotations: any[] = [];
+  const mapSeed: any = {};
+  const res = Conductor.convertToObj(true, true, axText, allowAnnotations, chordDic as any, mapSeed as any);
+  if (res.error) {
+    throw { details: [{ message: res.error.message, line: res.error.line, column: res.error.linePos, token: res.error.token }] };
+  }
+  const midiBuf = res.midi ? Buffer.from(new Uint8Array(res.midi)) : Buffer.alloc(0);
+  return midiBuf;
 }
 
 // Logger setup
@@ -47,10 +44,9 @@ const logOptions: any = {
   level: process.env.LOG_LEVEL ?? "info"
 };
 
-if (process.env.NODE_ENV === "development") {
-  logOptions.transport = {
-    target: "pino-pretty"
-  };
+// Enable pretty logging only when explicitly requested to avoid bundling worker issues
+if (process.env.PINO_PRETTY === "1") {
+  logOptions.transport = { target: "pino-pretty" };
 }
 
 const log = pino(logOptions);
@@ -70,18 +66,18 @@ async function ensureDir() {
   await fs.mkdir(DIR, { recursive: true });
 }
 
-// Validation schemas
-const validateSchema = z.object({
-  axText: z.string().min(1).max(MAX_AX_CHARS)
-});
+// Simple input validators
+function ensureString(v: any, name: string, opts?: { min?: number; max?: number }) {
+  if (typeof v !== "string") throw new Error(`${name} must be a string`);
+  const s = v.trim();
+  const min = opts?.min ?? 0;
+  const max = opts?.max ?? Infinity;
+  if (s.length < min) throw new Error(`${name} must be at least ${min} characters`);
+  if (s.length > max) throw new Error(`${name} must be <= ${max} characters`);
+  return s;
+}
 
-const compileSchema = z.object({
-  axText: z.string().min(1).max(MAX_AX_CHARS),
-  options: z.object({
-    tempo: z.number().min(20).max(400).optional(),
-    timeSig: z.string().regex(/^[0-9]+\/[0-9]+$/).optional()
-  }).optional()
-});
+// No options supported: tempo/time signature must be specified in Axentax syntax header.
 
 // Core functions
 async function validateAx(axText: string) {
@@ -100,8 +96,8 @@ async function validateAx(axText: string) {
   }
 }
 
-async function compileToMidi(axText: string, options?: any) {
-  const key = JSON.stringify({ axText, options });
+async function compileToMidi(axText: string) {
+  const key = axText; // Hash based only on source text
   const hash = sha256(key);
   const outputPath = midiPath(hash);
   
@@ -117,7 +113,7 @@ async function compileToMidi(axText: string, options?: any) {
       setTimeout(() => reject(new Error("Compilation timeout")), COMPILE_TIMEOUT_MS)
     );
     
-    const compilePromise = compile(axText, options);
+    const compilePromise = compile(axText);
     
     try {
       const buffer = await Promise.race([compilePromise, timeoutPromise]);
@@ -148,7 +144,7 @@ const server = new Server(
 );
 
 // Tool implementations
-server.setRequestHandler("tools/list" as any, async () => {
+server.setRequestHandler(ListToolsRequestSchema, async () => {
   return {
     tools: [
       {
@@ -169,7 +165,7 @@ server.setRequestHandler("tools/list" as any, async () => {
       },
       {
         name: "compile_to_midi",
-        description: "Compile Axentax to MIDI and return a resource URI.",
+        description: "Compile Axentax to MIDI and return a resource URI. Tempo/TimeSig must be specified in Axentax header (e.g., '@@ 120 4/4 { ... }').",
         inputSchema: {
           type: "object",
           properties: {
@@ -178,23 +174,6 @@ server.setRequestHandler("tools/list" as any, async () => {
               minLength: 1, 
               maxLength: MAX_AX_CHARS,
               description: "Axentax DSL code to compile"
-            },
-            options: {
-              type: "object",
-              properties: {
-                tempo: { 
-                  type: "integer", 
-                  minimum: 20, 
-                  maximum: 400,
-                  description: "Tempo in BPM"
-                },
-                timeSig: { 
-                  type: "string", 
-                  pattern: "^[0-9]+/[0-9]+$",
-                  description: "Time signature (e.g., '4/4')"
-                }
-              },
-              additionalProperties: false
             }
           },
           required: ["axText"],
@@ -205,12 +184,12 @@ server.setRequestHandler("tools/list" as any, async () => {
   };
 });
 
-server.setRequestHandler("tools/call" as any, async (request: any) => {
-  const { name, arguments: args } = request.params;
+server.setRequestHandler(CallToolRequestSchema, async (request) => {
+  const { name, arguments: args } = (request.params ?? { name: "", arguments: {} }) as any;
   
   try {
     if (name === "validate") {
-      const { axText } = validateSchema.parse(args);
+      const axText = ensureString(args?.axText, "axText", { min: 1, max: MAX_AX_CHARS });
       const result = await validateAx(axText);
       
       return {
@@ -224,7 +203,7 @@ server.setRequestHandler("tools/call" as any, async (request: any) => {
     }
     
     if (name === "compile_to_midi") {
-      const { axText, options } = compileSchema.parse(args);
+      const axText = ensureString(args?.axText, "axText", { min: 1, max: MAX_AX_CHARS });
       
       // First validate
       const validationResult = await validateAx(axText);
@@ -240,12 +219,7 @@ server.setRequestHandler("tools/call" as any, async (request: any) => {
       }
       
       // Then compile - handle optional options properly
-      const compileOptions = options ? {
-        ...(options.tempo !== undefined && { tempo: options.tempo }),
-        ...(options.timeSig !== undefined && { timeSig: options.timeSig })
-      } : undefined;
-      
-      const { hash, size } = await compileToMidi(axText, compileOptions);
+      const { hash, size } = await compileToMidi(axText);
       
       const result = {
         ok: true,
@@ -294,28 +268,34 @@ server.setRequestHandler("tools/call" as any, async (request: any) => {
 });
 
 // Resource implementations
-server.setRequestHandler("resources/list" as any, async () => {
+server.setRequestHandler(ListResourcesRequestSchema, async () => {
+  // No static resources; all access is via template URIs.
+  return { resources: [] } as any;
+});
+
+server.setRequestHandler(ListResourceTemplatesRequestSchema, async () => {
   return {
-    resources: [
+    resourceTemplates: [
       {
+        name: "axentax-midi",
+        title: "Axentax MIDI",
         uriTemplate: "mcp://axentax/midi/{hash}",
-        name: "Axentax MIDI",
         mimeType: "audio/midi",
         description: "Compiled MIDI file from Axentax DSL"
       }
     ]
-  };
+  } as any;
 });
 
-server.setRequestHandler("resources/read" as any, async (request: any) => {
-  const { uri } = request.params;
+server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
+  const { uri } = request.params ?? { uri: "" } as any;
   
   const match = uri.match(/^mcp:\/\/axentax\/midi\/([a-f0-9]{64})$/);
   if (!match) {
     throw new Error("Invalid resource URI format");
   }
   
-  const hash = match[1];
+  const hash = match[1]!;
   const filePath = midiPath(hash);
   
   try {
@@ -351,7 +331,7 @@ async function startHttpServer() {
   // Validate endpoint
   app.post("/valid", async (req, res) => {
     try {
-      const { axText } = validateSchema.parse(req.body);
+      const axText = ensureString(req.body?.axText, "axText", { min: 1, max: MAX_AX_CHARS });
       const result = await validateAx(axText);
       
       return result.ok ? res.json(result) : res.status(400).json(result);
@@ -367,7 +347,7 @@ async function startHttpServer() {
   // Compile endpoint
   app.post("/midi", async (req, res) => {
     try {
-      const { axText, options } = compileSchema.parse(req.body);
+      const axText = ensureString(req.body?.axText, "axText", { min: 1, max: MAX_AX_CHARS });
       
       // Validate first
       const validationResult = await validateAx(axText);
@@ -376,12 +356,7 @@ async function startHttpServer() {
       }
       
       // Compile - handle optional options properly
-      const compileOptions = options ? {
-        ...(options.tempo !== undefined && { tempo: options.tempo }),
-        ...(options.timeSig !== undefined && { timeSig: options.timeSig })
-      } : undefined;
-      
-      const { hash } = await compileToMidi(axText, compileOptions);
+      const { hash } = await compileToMidi(axText);
       
       return res.json({
         ok: true,

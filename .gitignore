@@ -80,7 +80,6 @@ out
 
 # Nuxt.js build / generate output
 .nuxt
-dist
 
 # Gatsby files
 .cache/
@@ -142,3 +141,4 @@ x-todo.md
 CLAUDE.md
 .claude
 AGENT.md
+data/midi
